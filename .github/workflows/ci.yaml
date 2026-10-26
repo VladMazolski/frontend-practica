@@ -1,0 +1,226 @@
+name: ci
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+# Variables globales
+env:
+  REGISTRY: vladmazolski
+  IMAGE_NAME: frontend-practica
+  VERSION: v1.0.0-practica
+  # Quality Gate de Sonar: "true" = fallar cerrado (exit 1), "false" = solo advertir
+  SONAR_GATE_STRICT: "false"
+
+jobs:
+  # 1) Pruebas unitarias (Jest) en cada push a main
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm run test
+
+      - name: Export coverage report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage
+          path: coverage/
+          if-no-files-found: warn
+
+  # 2) SonarCloud: calidad de código. Secrets: SONAR_TOKEN, SONAR_ORGANIZATION, SONAR_PROJECT_KEY
+  codeScan:
+    name: SonarCloud Scan
+    needs: test
+    runs-on: ubuntu-latest
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      SONAR_ORGANIZATION: ${{ secrets.SONAR_ORGANIZATION }}
+      SONAR_PROJECT_KEY: ${{ secrets.SONAR_PROJECT_KEY }}
+    steps:
+      # Checklist: nunca fallar en silencio
+      - name: Check requirements
+        id: check
+        run: |
+          if [ -z "$SONAR_TOKEN" ] || [ -z "$SONAR_ORGANIZATION" ] || [ -z "$SONAR_PROJECT_KEY" ]; then
+            echo "::warning title=SonarCloud omitido::Faltan secrets: SONAR_TOKEN, SONAR_ORGANIZATION o SONAR_PROJECT_KEY"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout code
+        if: steps.check.outputs.ready == 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download coverage report
+        if: steps.check.outputs.ready == 'true'
+        uses: actions/download-artifact@v8
+        with:
+          name: coverage
+          path: coverage/
+
+      - name: SonarCloud Scan
+        if: steps.check.outputs.ready == 'true'
+        uses: SonarSource/sonarqube-scan-action@v8
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          args: >
+            -Dsonar.organization=${{ secrets.SONAR_ORGANIZATION }}
+            -Dsonar.projectKey=${{ secrets.SONAR_PROJECT_KEY }}
+            -Dsonar.exclusions=node_modules/**,coverage/**,dist/**
+            -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
+
+      - name: Get SonarCloud status
+        if: steps.check.outputs.ready == 'true'
+        run: |
+          for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            curl -s -u "$SONAR_TOKEN:" "https://sonarcloud.io/api/qualitygates/project_status?projectKey=$SONAR_PROJECT_KEY" -o sonar-result.json
+            STATUS=$(jq -r '.projectStatus.status' sonar-result.json)
+            [ "$STATUS" != "NONE" ] && [ -n "$STATUS" ] && break
+            sleep 5
+          done
+          echo "SONAR_STATUS=$STATUS" >> "$GITHUB_ENV"
+          echo "Quality Gate: $STATUS"
+
+      - name: Export Sonar results
+        if: ${{ always() && steps.check.outputs.ready == 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: sonar-results
+          path: sonar-result.json
+          if-no-files-found: warn
+
+      - name: Check Status
+        if: steps.check.outputs.ready == 'true' && env.SONAR_STATUS == 'ERROR'
+        run: |
+          echo "::warning title=Quality Gate::SonarCloud reportó ERROR"
+          [ "$SONAR_GATE_STRICT" = "true" ] && exit 1 || exit 0
+
+  # 3) Snyk: dependencias. Falla el workflow si hay vulnerabilidades CRITICAL. Secret: SNYK_TOKEN
+  security:
+    name: Snyk Security
+    needs: test
+    runs-on: ubuntu-latest
+    env:
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+    steps:
+      - name: Check requirements
+        id: check
+        run: |
+          if [ -z "$SNYK_TOKEN" ]; then
+            echo "::warning title=Snyk omitido::Falta el secret SNYK_TOKEN"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout code
+        if: steps.check.outputs.ready == 'true'
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        if: steps.check.outputs.ready == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        if: steps.check.outputs.ready == 'true'
+        run: npm ci
+
+      # Sin continue-on-error: si hay CRITICAL el step (y el workflow) fallan
+      - name: Run Snyk
+        if: steps.check.outputs.ready == 'true'
+        uses: snyk/actions/node@master
+        with:
+          args: --severity-threshold=critical --sarif-file-output=snyk.sarif
+
+      - name: Export Snyk results
+        if: ${{ always() && steps.check.outputs.ready == 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: snyk-results
+          path: snyk.sarif
+          if-no-files-found: warn
+
+  # 4) Imagen: construir -> etiquetar -> escanear con Trivy -> publicar solo si el escaneo pasa
+  image:
+    name: Build, Scan (Trivy) and Push
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.VERSION }}
+
+      - name: Escanear imagen de Docker con Trivy
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.VERSION }}
+          format: table
+          output: trivy-report.txt
+          exit-code: "1"
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+
+      - name: Show Trivy report
+        if: ${{ always() }}
+        run: cat trivy-report.txt || true
+
+      - name: Export Trivy results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: trivy-results
+          path: trivy-report.txt
+          if-no-files-found: warn
+
+      - name: Check Docker Hub credentials
+        id: creds
+        env:
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          if [ -z "$DOCKER_PASSWORD" ]; then
+            echo "::warning title=Push omitido::Falta el secret DOCKER_PASSWORD (la imagen no se publica desde CI)"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Login to DockerHub
+        if: steps.creds.outputs.ready == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Push image
+        if: steps.creds.outputs.ready == 'true'
+        run: docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.VERSION }}
