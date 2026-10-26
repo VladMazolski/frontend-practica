@@ -14,10 +14,15 @@ describe('Pruebas unitarias de utils.js', () => {
     });
 
     it('debería retornar "Error" para puntajes menores a 70', () => {
-      // ESTA PRUEBA FALLA A PROPÓSITO:
-      // La función retorna 'Error', pero el test espera 'Fallo'
-      // El estudiante debe corregir la expectativa o la función.
-      expect(calculateStatus(50)).toBe('Fallo');
+      // Corregido: la función retorna 'Error' (el test esperaba 'Fallo', que no existe)
+      expect(calculateStatus(50)).toBe('Error');
+    });
+
+    it('debería respetar los límites entre categorías', () => {
+      expect(calculateStatus(89)).toBe('Warning');
+      expect(calculateStatus(69)).toBe('Error');
+      expect(calculateStatus(100)).toBe('Success');
+      expect(calculateStatus(0)).toBe('Error');
     });
   });
 
@@ -25,6 +30,10 @@ describe('Pruebas unitarias de utils.js', () => {
     it('debería devolver un string en formato HH:MM', () => {
       const date = new Date('2023-10-15T08:05:00');
       expect(formatTime(date)).toBe('08:05');
+    });
+
+    it('debería rellenar con ceros a medianoche', () => {
+      expect(formatTime(new Date('2023-10-15T00:00:00'))).toBe('00:00');
     });
   });
 });
